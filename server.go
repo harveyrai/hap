@@ -1,6 +1,9 @@
 package hap
 
 import (
+	"sync"
+	"time"
+
 	"github.com/brutella/dnssd"
 	"github.com/brutella/hap/accessory"
 	"github.com/brutella/hap/characteristic"
@@ -38,6 +41,10 @@ type Server struct {
 	// If empty, a random port is used.
 	Addr string
 
+	// Ifaces specifies at which interface the
+	// associated dnssd service is announced.
+	Ifaces []string
+
 	MfiCompliant bool   // default false
 	Protocol     string // default "1.0"
 	SetupId      string
@@ -57,6 +64,10 @@ type Server struct {
 	// for dnssd stuff
 	responder dnssd.Responder
 	handle    dnssd.ServiceHandle
+
+	mux  *sync.Mutex
+	sess map[string]interface{}
+	cons map[string]*conn
 }
 
 // A ServeMux lets you attach handlers to http url paths.
@@ -81,13 +92,16 @@ func NewServer(store Store, a *accessory.A, as ...*accessory.A) (*Server, error)
 	}
 
 	s := &Server{
-		ss: &http.Server{
-			Handler:   r,
-			ConnState: connStateEvent,
-		},
-		st: st,
-		a:  a,
-		as: as,
+		st:   st,
+		a:    a,
+		as:   as,
+		mux:  &sync.Mutex{},
+		sess: make(map[string]interface{}),
+		cons: make(map[string]*conn),
+	}
+	s.ss = &http.Server{
+		Handler:   r,
+		ConnState: s.connStateEvent,
 	}
 
 	// Load the stored uuid or generate a new one.
@@ -134,6 +148,7 @@ func NewServer(store Store, a *accessory.A, as ...*accessory.A) (*Server, error)
 		r.Get("/accessories", s.getAccessories)
 		r.Get("/characteristics", s.getCharacteristics)
 		r.Put("/characteristics", s.putCharacteristics)
+		r.Put("/prepare", s.prepareCharacteristics)
 		r.Post("/pairings", s.pairings)
 	})
 
@@ -148,8 +163,34 @@ func (s *Server) ServeMux() ServeMux {
 // IsAuthorized returns true if the provided
 // request is authorized to access accessory data.
 func (s *Server) IsAuthorized(request *http.Request) bool {
-	ss, _ := getSession(request.RemoteAddr)
+	ss, _ := s.getSession(request.RemoteAddr)
 	return ss != nil
+}
+
+func (s *Server) TimedWrite(request *http.Request) *TimedWrite {
+	if ss, _ := s.getSession(request.RemoteAddr); ss != nil {
+		return ss.twr
+	}
+
+	return nil
+}
+
+func (s *Server) SetTimedWrite(ttl, pid uint64, request *http.Request) {
+	if ss, _ := s.getSession(request.RemoteAddr); ss != nil {
+		t := time.Now().Add(time.Duration(ttl) * time.Millisecond)
+		ss.twr = &TimedWrite{t, pid}
+	}
+}
+
+func (s *Server) DelTimedWrite(request *http.Request) {
+	if ss, _ := s.getSession(request.RemoteAddr); ss != nil {
+		ss.twr = nil
+	}
+}
+
+// IsPaired returns true if the server is paired with a client (iOS).
+func (s *Server) IsPaired() bool {
+	return len(s.st.Pairings()) > 0
 }
 
 // ListenAndServe starts the server.
@@ -324,6 +365,75 @@ func (s *Server) prepare() error {
 	return nil
 }
 
+func (s *Server) connStateEvent(conn net.Conn, event http.ConnState) {
+	if event == http.StateClosed {
+		addr := conn.RemoteAddr().String()
+		s.mux.Lock()
+		delete(s.sess, addr)
+		delete(s.cons, addr)
+		s.mux.Unlock()
+	}
+}
+
+func (s *Server) getSession(addr string) (*session, error) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if v, ok := s.sess[addr]; ok {
+		if s, ok := v.(*session); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("unexpected session %T", v)
+	}
+
+	return nil, fmt.Errorf("no session for %s", addr)
+}
+
+func (s *Server) getPairVerifySession(addr string) (*pairVerifySession, error) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if v, ok := s.sess[addr]; ok {
+		if s, ok := v.(*pairVerifySession); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("unexpected session %T", v)
+	}
+
+	return nil, fmt.Errorf("no session for %s", addr)
+}
+
+func (s *Server) getPairSetupSession(addr string) (*pairSetupSession, error) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if v, ok := s.sess[addr]; ok {
+		if s, ok := v.(*pairSetupSession); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("unexpected session %T", v)
+	}
+
+	return nil, fmt.Errorf("no session for %s", addr)
+}
+
+func (s *Server) setSession(addr string, v interface{}) {
+	s.mux.Lock()
+	s.sess[addr] = v
+	s.mux.Unlock()
+}
+
+func (s *Server) sessions() map[string]interface{} {
+	copy := map[string]interface{}{}
+	s.mux.Lock()
+	for k, v := range s.sess {
+		copy[k] = v
+	}
+	s.mux.Unlock()
+
+	return copy
+}
+
 func (s *Server) savePairing(p Pairing) error {
 	err := s.st.SavePairing(p)
 	if err != nil {
@@ -344,8 +454,11 @@ func (s *Server) deletePairing(p Pairing) error {
 	return nil
 }
 
-func (s *Server) isPaired() bool {
-	return len(s.st.Pairings()) > 0
+func (s *Server) deleteAllPairings() {
+	for _, p := range s.st.Pairings() {
+		s.st.DeletePairing(p.Name)
+	}
+	s.updateTxtRecords()
 }
 
 func (s *Server) pairedWithAdmin() bool {
@@ -364,7 +477,7 @@ func (s *Server) txtRecords() map[string]string {
 		"id": s.uuid,
 		"c#": fmt.Sprintf("%d", s.version),
 		"s#": "1",
-		"sf": fmt.Sprintf("%d", to.Int64(!s.isPaired())),
+		"sf": fmt.Sprintf("%d", to.Int64(!s.IsPaired())),
 		"ff": fmt.Sprintf("%d", to.Int64(s.MfiCompliant)),
 		"md": s.a.Name(),
 		"ci": fmt.Sprintf("%d", s.a.Type),
@@ -402,6 +515,7 @@ func (s *Server) service() (dnssd.Service, error) {
 		Host:   strings.Replace(s.uuid, ":", "", -1), // use the id (without the colons) to get unique hostnames
 		Text:   s.txtRecords(),
 		Port:   s.port,
+		Ifaces: s.Ifaces,
 	}
 
 	return dnssd.NewService(cfg)

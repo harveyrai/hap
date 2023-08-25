@@ -11,18 +11,20 @@ import (
 const (
 	PermissionRead          = "pr" // The characteristic can only be read by paired controllers.
 	PermissionWrite         = "pw" // The characteristic can only be written by paired controllers.
+	PermissionTimedWrite    = "tw" // The characteristic allows only timed write procedure.
 	PermissionEvents        = "ev" // The characteristic supports events.
-	PermissionHidden        = "hd" // The characteristic is hidden from the user
-	PermissionWriteResponse = "wr" // The characteristic supports write response
+	PermissionHidden        = "hd" // The characteristic is hidden from the user.
+	PermissionWriteResponse = "wr" // The characteristic supports write response.
 )
 
 const (
-	UnitPercentage = "percentage" // %
-	UnitArcDegrees = "arcdegrees" // °
-	UnitCelsius    = "celsius"    // °C
-	UnitLux        = "lux"        // lux
-	UnitSeconds    = "seconds"    // sec
-	UnitPPM        = "ppm"        // ppm
+	UnitPercentage              = "percentage" // %
+	UnitArcDegrees              = "arcdegrees" // °
+	UnitCelsius                 = "celsius"    // °C
+	UnitLux                     = "lux"        // lux
+	UnitSeconds                 = "seconds"    // sec
+	UnitPPM                     = "ppm"        // ppm
+	UnitMicrogramsPerCubicMeter = "micrograms/m^3"
 )
 
 const (
@@ -101,7 +103,7 @@ type C struct {
 	// If the communication fails, you can return a code != 0.
 	// In this case, the server responds with the HTTP status code 500 and the code
 	// in the response body (as defined in HAP-R2 6.7.1.4 HAP Status Codes).
-	SetValueRequestFunc func(value interface{}, request *http.Request) int
+	SetValueRequestFunc func(value interface{}, request *http.Request) (response interface{}, code int)
 
 	// A list of update value functions.
 	// There are called when the value of the characteristic is updated.
@@ -129,19 +131,19 @@ func (c *C) OnCValueUpdate(fn ValueUpdateFunc) {
 
 // Sets the value of c to val and returns a status code.
 // The server invokes this function when the value is updated by an http request.
-func (c *C) SetValueRequest(val interface{}, req *http.Request) int {
+func (c *C) SetValueRequest(val interface{}, req *http.Request) (interface{}, int) {
 	// check write permission
-	if !c.IsWritable() {
+	if req != nil && !c.IsWritable() {
 		log.Info.Printf("writing %v by %s not allowed\n", val, req.RemoteAddr)
-		return -70404
+		return val, -70404
 	}
 
 	return c.setValue(val, req)
 }
 
-func (c *C) setValue(v interface{}, req *http.Request) int {
+func (c *C) setValue(v interface{}, req *http.Request) (interface{}, int) {
 	newVal := c.convert(v)
-
+	response := newVal
 	// Value must be within min and max
 	switch c.Format {
 	case FormatFloat:
@@ -153,16 +155,21 @@ func (c *C) setValue(v interface{}, req *http.Request) int {
 	// ignore the same newVal
 	if c.Val == newVal && !c.updateOnSameValue {
 		// no error
-		return 0
+		return nil, 0
 	}
 
 	if !c.validVal(newVal) {
-		return -70410
+		return nil, -70410
 	}
 
 	if c.SetValueRequestFunc != nil && req != nil {
-		if s := c.SetValueRequestFunc(newVal, req); s != 0 {
-			return s
+		v, c := c.SetValueRequestFunc(newVal, req)
+		if c != 0 {
+			return v, c
+		}
+
+		if v != nil {
+			response = v
 		}
 	}
 
@@ -177,7 +184,7 @@ func (c *C) setValue(v interface{}, req *http.Request) int {
 		fn(c, newVal, oldVal, req)
 	}
 
-	return 0
+	return response, 0
 }
 
 // ValueRequest returns the value of C and a status code.
@@ -197,11 +204,13 @@ func (c *C) ValueRequest(req *http.Request) (interface{}, int) {
 	return c.value(), 0
 }
 
-// value returns the value of C and a status code.
+// value returns the value of C
 func (c *C) value() interface{} {
 	return c.Val
 }
 
+// IsWritable returns true if clients are allowed
+// to update the value of the characteristic.
 func (c *C) IsWritable() bool {
 	for _, p := range c.Permissions {
 		if p == PermissionWrite {
@@ -212,6 +221,8 @@ func (c *C) IsWritable() bool {
 	return false
 }
 
+// IsReadable returns true if clients are allowed
+// to read the value of the characteristic.
 func (c *C) IsReadable() bool {
 	for _, p := range c.Permissions {
 		if p == PermissionRead {
@@ -222,6 +233,20 @@ func (c *C) IsReadable() bool {
 	return false
 }
 
+// RequiresTimedWrite returns true if the value can
+// only be set with a timed write procedure.
+func (c *C) RequiresTimedWrite() bool {
+	for _, p := range c.Permissions {
+		if p == PermissionTimedWrite {
+			return true
+		}
+	}
+
+	return false
+}
+
+// IsObservable returns true if clients are allowed
+// to observe the value of the characteristic.
 func (c *C) IsObservable() bool {
 	for _, p := range c.Permissions {
 		if p == PermissionEvents {
@@ -232,6 +257,8 @@ func (c *C) IsObservable() bool {
 	return false
 }
 
+// IsObservable returns true if the value of the
+// characteristic can only be updated, but not read.
 func (c *C) IsWriteOnly() bool {
 	return len(c.Permissions) == 1 && c.Permissions[0] == PermissionWrite
 }
@@ -273,6 +300,8 @@ func (c *C) MarshalJSON() ([]byte, error) {
 		// 2022-03-21 (mah) FIXME provide a http request instead of nil
 		if v, s := c.ValueRequest(nil); s == 0 {
 			d.Value = &V{v}
+		} else {
+			d.Value = &V{c.Val} // dummy "zero" value
 		}
 	}
 
@@ -327,6 +356,11 @@ func (c *C) convert(v interface{}) interface{} {
 }
 
 func (c *C) validVal(v interface{}) bool {
+	iv, ok := v.(int)
+	if !ok {
+		return true
+	}
+
 	if len(c.ValidVals) > 0 {
 		for _, val := range c.ValidVals {
 			if val == v {
@@ -337,7 +371,7 @@ func (c *C) validVal(v interface{}) bool {
 		return false
 	}
 
-	if iv, ok := v.(int); ok && len(c.ValidRange) == 2 {
+	if len(c.ValidRange) == 2 {
 		return c.ValidRange[0] <= iv && c.ValidRange[1] >= iv
 	}
 
